@@ -18,6 +18,7 @@ struct PortConfig {
 // 封装一个 DPDK 端口的生命周期：配置 → 启动 → 收发 → 停止
 class Port {
 public:
+    Port() = default;
     explicit Port(const PortConfig& cfg) : cfg_(cfg) {}
 
     // 配置收发队列并启动端口。mempool 用于接收侧分配 mbuf。
