@@ -1,64 +1,157 @@
 // dpdk-forwarder —— 基于 DPDK 的用户态报文转发与 ACL 过滤系统
 //
-// 当前为最小骨架：初始化 EAL、枚举端口、打印基本信息。
-// 后续按 docs/项目规划书.md 的里程碑逐步填入解析、ACL、会话与转发逻辑。
+// 当前阶段（里程碑第 2 周）：端口初始化 + 收发主循环 + 实时速率统计。
+// 转发逻辑、ACL、会话表按 docs/项目规划书.md 的里程碑逐步加入。
 
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include <cinttypes>
 
 #include <rte_eal.h>
 #include <rte_ethdev.h>
-#include <rte_ether.h>
+#include <rte_lcore.h>
 #include <rte_mbuf.h>
+#include <rte_mempool.h>
+#include <rte_timer.h>
+
+#include "common.h"
+#include "port.h"
 
 namespace {
 
-void print_port_info(uint16_t port_id) {
-    rte_eth_dev_info dev_info{};
-    if (rte_eth_dev_info_get(port_id, &dev_info) != 0) {
-        std::printf("  port %u: 获取设备信息失败\n", port_id);
-        return;
+volatile std::sig_atomic_t g_stop = 0;
+
+void on_signal(int /*signo*/) { g_stop = 1; }
+
+rte_mempool* create_mempool() {
+    rte_mempool* pool = rte_pktmbuf_pool_create(
+        "MBUF_POOL",
+        fwd::kDefaultNbMbufs,
+        fwd::kDefaultMbufCacheSize,
+        0,
+        RTE_MBUF_DEFAULT_BUF_SIZE,
+        static_cast<int>(rte_socket_id()));
+    if (pool == nullptr) {
+        std::fprintf(stderr, "创建 mbuf 内存池失败: %s\n", rte_strerror(rte_errno));
     }
-
-    rte_ether_addr mac{};
-    rte_eth_macaddr_get(port_id, &mac);
-
-    std::printf("  port %u\n", port_id);
-    std::printf("    driver   : %s\n", dev_info.driver_name);
-    std::printf("    mac      : %02X:%02X:%02X:%02X:%02X:%02X\n",
-                mac.addr_bytes[0], mac.addr_bytes[1], mac.addr_bytes[2],
-                mac.addr_bytes[3], mac.addr_bytes[4], mac.addr_bytes[5]);
-    std::printf("    rx queue : %u\n", dev_info.max_rx_queues);
-    std::printf("    tx queue : %u\n", dev_info.max_tx_queues);
-    std::printf("    rx offload: 0x%lx\n",
-                static_cast<unsigned long>(dev_info.rx_offload_capa));
-    std::printf("    tx offload: 0x%lx\n",
-                static_cast<unsigned long>(dev_info.tx_offload_capa));
+    return pool;
 }
+
+// 把字节数换算成便于阅读的带宽文本
+void format_rate(double bytes_per_sec, char* out, size_t out_len) {
+    const double bits = bytes_per_sec * 8.0;
+    if (bits >= 1e9) {
+        std::snprintf(out, out_len, "%.2f Gbps", bits / 1e9);
+    } else if (bits >= 1e6) {
+        std::snprintf(out, out_len, "%.2f Mbps", bits / 1e6);
+    } else if (bits >= 1e3) {
+        std::snprintf(out, out_len, "%.2f Kbps", bits / 1e3);
+    } else {
+        std::snprintf(out, out_len, "%.2f bps", bits);
+    }
+}
+
+struct Counters {
+    uint64_t pkts = 0;
+    uint64_t bytes = 0;
+};
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    int ret = rte_eal_init(argc, argv);
+    const int ret = rte_eal_init(argc, argv);
     if (ret < 0) {
         rte_exit(EXIT_FAILURE, "EAL 初始化失败\n");
     }
     argc -= ret;
     argv += ret;
 
+    std::signal(SIGINT, on_signal);
+    std::signal(SIGTERM, on_signal);
+
     const uint16_t port_count = rte_eth_dev_count_avail();
     std::printf("=== dpdk-forwarder ===\n");
-    std::printf("已探测到 %u 个 DPDK 端口\n", port_count);
-
-    for (uint16_t port = 0; port < port_count; ++port) {
-        print_port_info(port);
-    }
-
+    std::printf("可用端口数: %u\n", port_count);
     if (port_count == 0) {
-        std::printf("没有可用端口。请先用 scripts/bind_ports.sh 绑定网卡。\n");
+        rte_exit(EXIT_FAILURE,
+                 "没有可用端口。真实环境请先绑定网卡，WSL 里可用 "
+                 "--vdev=net_tap0 创建虚拟端口。\n");
     }
 
+    rte_mempool* pool = create_mempool();
+    if (pool == nullptr) {
+        rte_exit(EXIT_FAILURE, "内存池创建失败\n");
+    }
+    std::printf("mbuf 内存池: %u 个 mbuf，每个 %u 字节，cache %u\n",
+                fwd::kDefaultNbMbufs,
+                static_cast<unsigned>(RTE_MBUF_DEFAULT_BUF_SIZE),
+                fwd::kDefaultMbufCacheSize);
+
+    // 目前只使用第一个端口：先验证收包路径，后续再做端口间转发
+    fwd::PortConfig cfg;
+    cfg.port_id = 0;
+    cfg.nb_rx_queue = fwd::kDefaultNbRxQueue;
+    cfg.nb_tx_queue = fwd::kDefaultNbTxQueue;
+    cfg.nb_rx_desc = fwd::kDefaultRxDesc;
+    cfg.nb_tx_desc = fwd::kDefaultTxDesc;
+
+    fwd::Port port(cfg);
+    const int init_ret = port.init(pool);
+    if (init_ret < 0) {
+        port.stop();
+        rte_exit(EXIT_FAILURE, "端口初始化失败\n");
+    }
+    port.start();
+    port.dump_info();
+
+    std::printf("\n开始收包（Ctrl+C 退出）...\n\n");
+
+    rte_mbuf* bufs[fwd::kDefaultBurstSize];
+    const uint64_t ticks_per_sec = rte_get_timer_hz();
+    uint64_t last_report = rte_get_timer_cycles();
+
+    Counters cur;
+    Counters prev;
+
+    while (g_stop == 0) {
+        const uint16_t nb_rx = port.rx_burst(bufs, fwd::kDefaultBurstSize);
+        if (nb_rx > 0) {
+            for (uint16_t i = 0; i < nb_rx; ++i) {
+                cur.bytes += rte_pktmbuf_pkt_len(bufs[i]);
+            }
+            cur.pkts += nb_rx;
+
+            // 当前阶段先把包释放掉，只做收包与统计。
+            // 下一步会替换成 ACK → ACL 匹配 → 转发的处理链。
+            rte_pktmbuf_free_bulk(bufs, nb_rx);
+        }
+
+        const uint64_t now = rte_get_timer_cycles();
+        if (now - last_report >= ticks_per_sec * fwd::kStatsIntervalSec) {
+            const double elapsed =
+                static_cast<double>(now - last_report) / static_cast<double>(ticks_per_sec);
+            const uint64_t d_pkts = cur.pkts - prev.pkts;
+            const uint64_t d_bytes = cur.bytes - prev.bytes;
+
+            char rate[32];
+            format_rate(static_cast<double>(d_bytes) / elapsed, rate, sizeof(rate));
+
+            std::printf("RX: %" PRIu64 " pkt/s  %s  (累计 %" PRIu64 " 包 / %" PRIu64 " 字节)\n",
+                        static_cast<uint64_t>(static_cast<double>(d_pkts) / elapsed),
+                        rate, cur.pkts, cur.bytes);
+            std::fflush(stdout);
+
+            prev = cur;
+            last_report = now;
+        }
+    }
+
+    std::printf("\n收到退出信号，正在停止...\n");
+    port.stop();
+
+    rte_mempool_free(pool);
     rte_eal_cleanup();
+    std::printf("已退出。\n");
     return 0;
 }
