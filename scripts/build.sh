@@ -23,3 +23,9 @@ cmake --build build -j "$(nproc)"
 
 echo
 echo "产物: $ROOT_DIR/build/dpdk-forwarder"
+
+if [[ -x "$ROOT_DIR/build/test_basic" ]]; then
+    echo
+    echo "运行单元测试："
+    "$ROOT_DIR/build/test_basic"
+fi

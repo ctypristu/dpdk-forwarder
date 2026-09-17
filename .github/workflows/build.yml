@@ -1,0 +1,54 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake meson ninja-build pkg-config \
+            python3-pyelftools libnuma-dev libpcap-dev libelf-dev
+
+      - name: 缓存 DPDK
+        id: dpdk-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/lib/x86_64-linux-gnu
+          key: dpdk-24.11-${{ runner.os }}-${{ runner.arch }}
+
+      - name: 编译并安装 DPDK
+        run: |
+          if pkg-config --exists libdpdk; then
+            echo "DPDK 已从缓存恢复: $(pkg-config --modversion libdpdk)"
+          else
+            wget -q https://fast.dpdk.org/rel/dpdk-24.11.tar.xz
+            tar xf dpdk-24.11.tar.xz
+            cd dpdk-24.11
+            meson setup build
+            ninja -C build
+            sudo ninja -C build install
+            sudo ldconfig
+          fi
+          echo "=== DPDK 版本 ==="
+          pkg-config --modversion libdpdk
+
+      - name: 编译项目
+        run: ./scripts/build.sh
+
+      - name: 运行单元测试
+        run: |
+          cd build
+          ctest --output-on-failure
