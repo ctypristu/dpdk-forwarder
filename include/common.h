@@ -24,4 +24,12 @@ constexpr uint16_t kDefaultNbTxQueue = 1;
 // 统计输出间隔（秒）
 constexpr uint32_t kStatsIntervalSec = 1;
 
+// ACL 规则表容量与会话表容量。
+//
+// 这两个值直接决定内存占用：会话表每条大约 48 字节（结构体）+ 哈希表开销。
+// 这里的默认值偏保守，是为了能在 WSL / 内存受限的环境里跑起来。
+// 真机测试时（配好大页、内存充足）可以调大，比如会话表用 1<<20。
+constexpr uint32_t kDefaultAclEntries = 1u << 16;       // 65536 条规则
+constexpr uint32_t kDefaultSessionEntries = 1u << 16;   // 65536 条会话
+
 }  // namespace fwd

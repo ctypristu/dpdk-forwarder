@@ -2,14 +2,20 @@
 //
 // 里程碑进度：
 //   第 2 周  端口初始化、mempool、收包与速率统计
-//   第 3 周  报文解析、MAC 表学习与二层转发   ← 当前
+//   第 3 周  报文解析、MAC 表学习与二层转发
+//   第 4-5 周  ACL 规则匹配与会话跟踪          ← 当前
 //
-// 下一步：ACL 规则匹配与会话跟踪（第 4-5 周）
+// 处理模型（快慢路径分流）：
+//   首包   → 查 ACL 规则表（慢路径），命中则建会话
+//   后续包 → 查会话表（快路径），直接按会话动作处理
+
+#include <arpa/inet.h>
 
 #include <csignal>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include <rte_eal.h>
 #include <rte_ethdev.h>
@@ -18,10 +24,12 @@
 #include <rte_mempool.h>
 #include <rte_timer.h>
 
+#include "acl.h"
 #include "common.h"
 #include "mac_table.h"
 #include "packet.h"
 #include "port.h"
+#include "session.h"
 
 namespace {
 
@@ -61,19 +69,24 @@ struct Counters {
     uint64_t rx_bytes = 0;
     uint64_t tx_pkts = 0;
     uint64_t tx_bytes = 0;
-    uint64_t flooded = 0;   // 目的 MAC 未知，泛洪的次数
-    uint64_t dropped = 0;   // 发送失败或无出口
+    uint64_t flooded = 0;
+    uint64_t dropped = 0;
+    uint64_t acl_hit = 0;       // 首包在 ACL 表里查到规则
+    uint64_t acl_default = 0;   // 首包没查到规则，走默认动作
+    uint64_t session_hit = 0;   // 后续包命中会话表
+    uint64_t denied = 0;        // 被策略拒绝（含会话判定的）
 };
 
-// 通道号到端口号的映射：只使用配置里给定的一组端口
 struct Forwarder {
     fwd::Port* ports = nullptr;
     uint16_t port_count = 0;
     fwd::MacTable mac_table;
+    fwd::AclTable acl;
+    fwd::SessionTable sessions;
     Counters stats;
+    fwd::AclAction default_action = fwd::AclAction::kPass;
 };
 
-// 把一个包从指定端口发出去。失败则释放。
 void send_on_port(Forwarder& fw, uint16_t out_port, rte_mbuf* m) {
     fwd::Port& port = fw.ports[out_port];
     if (port.tx_burst(&m, 1) == 1) {
@@ -85,7 +98,6 @@ void send_on_port(Forwarder& fw, uint16_t out_port, rte_mbuf* m) {
     }
 }
 
-// 泛洪：从除入端口以外的所有端口发出去
 void flood(Forwarder& fw, uint16_t in_port, rte_mbuf* m) {
     fw.stats.flooded += 1;
 
@@ -93,9 +105,9 @@ void flood(Forwarder& fw, uint16_t in_port, rte_mbuf* m) {
         if (p == in_port) {
             continue;
         }
-        // 最后一个出口直接用原 mbuf，前面的出口都要拷贝
+        // 最后一个出口直接用原 mbuf，避免多余的拷贝
         const bool is_last = (p == fw.port_count - 1) ||
-                             (in_port == fw.port_count - 1 && p == fw.port_count - 2);
+                             (in_port == fw.port_count - 1 && p + 1 == fw.port_count - 1);
         if (is_last) {
             send_on_port(fw, p, m);
             return;
@@ -105,11 +117,37 @@ void flood(Forwarder& fw, uint16_t in_port, rte_mbuf* m) {
             send_on_port(fw, p, copy);
         }
     }
-    // 所有出口都发过了还没 return，说明没找到"最后一个"，直接释放
     rte_pktmbuf_free(m);
 }
 
-// 处理一个收到的包：学习源地址 → 查目的地址 → 转发
+// 按会话动作决定这个包怎么处理
+void apply_action(Forwarder& fw, uint16_t in_port, rte_mbuf* m, fwd::AclAction action,
+                  const fwd::PacketInfo& info, uint64_t now_sec) {
+    if (action == fwd::AclAction::kDrop) {
+        fw.stats.denied += 1;
+        rte_pktmbuf_free(m);
+        return;
+    }
+
+    // 放行：按二层转发逻辑送出
+    if (fwd::is_broadcast_or_multicast(info.eth->dst_addr)) {
+        flood(fw, in_port, m);
+        return;
+    }
+
+    uint16_t out_port = 0;
+    if (!fw.mac_table.lookup(info.eth->dst_addr, &out_port, now_sec)) {
+        flood(fw, in_port, m);
+        return;
+    }
+    if (out_port == in_port) {
+        fw.stats.dropped += 1;
+        rte_pktmbuf_free(m);
+        return;
+    }
+    send_on_port(fw, out_port, m);
+}
+
 void handle_packet(Forwarder& fw, uint16_t in_port, rte_mbuf* m, uint64_t now_sec) {
     fwd::PacketInfo info;
     if (!fwd::parse_packet(m, info)) {
@@ -118,30 +156,113 @@ void handle_packet(Forwarder& fw, uint16_t in_port, rte_mbuf* m, uint64_t now_se
         return;
     }
 
-    // 1) 学习源 MAC 与入端口的关系
+    // 学习源 MAC（不论后续是否放行，先学习，与交换机行为一致）
     fw.mac_table.learn(info.eth->src_addr, in_port, now_sec);
 
-    // 2) 组播/广播直接泛洪（交换机的基本行为）
-    if (fwd::is_broadcast_or_multicast(info.eth->dst_addr)) {
-        flood(fw, in_port, m);
+    const uint32_t pkt_len = rte_pktmbuf_pkt_len(m);
+
+    // 非 IPv4 报文（ARP / IPv6 等）不做 ACL，直接按二层转发。
+    // 注意这里只判断 has_ipv4：ICMP 这类协议没有端口，但同样应该受 ACL 管，
+    // 它的 src_port / dst_port 保持 0 参与匹配。
+    if (!info.has_ipv4) {
+        if (fwd::is_broadcast_or_multicast(info.eth->dst_addr)) {
+            flood(fw, in_port, m);
+            return;
+        }
+        uint16_t out_port = 0;
+        if (fw.mac_table.lookup(info.eth->dst_addr, &out_port, now_sec) && out_port != in_port) {
+            send_on_port(fw, out_port, m);
+        } else {
+            flood(fw, in_port, m);
+        }
         return;
     }
 
-    // 3) 查目的 MAC
-    uint16_t out_port = 0;
-    if (!fw.mac_table.lookup(info.eth->dst_addr, &out_port, now_sec)) {
-        flood(fw, in_port, m);  // 未知单播：泛洪
+    fwd::FiveTuple tuple;
+    tuple.src_ip = info.src_ip;
+    tuple.dst_ip = info.dst_ip;
+    tuple.src_port = info.src_port;
+    tuple.dst_port = info.dst_port;
+    tuple.proto = info.ip_proto;
+
+    // ---- 快路径：先查会话表 ----
+    if (auto* session = fw.sessions.find_and_touch(tuple, now_sec, pkt_len)) {
+        fw.stats.session_hit += 1;
+        apply_action(fw, in_port, m, session->action, info, now_sec);
         return;
     }
 
-    if (out_port == in_port) {
-        // 出口就是入端口，说明目的地在本端口后面，丢弃避免回环
-        fw.stats.dropped += 1;
-        rte_pktmbuf_free(m);
-        return;
+    // ---- 慢路径：首包查 ACL，并建立会话 ----
+    fwd::AclAction action = fw.default_action;
+    if (fw.acl.lookup(tuple, &action)) {
+        fw.stats.acl_hit += 1;
+    } else {
+        fw.stats.acl_default += 1;
     }
 
-    send_on_port(fw, out_port, m);
+    fw.sessions.create(tuple, action, now_sec);
+    apply_action(fw, in_port, m, action, info, now_sec);
+}
+
+// 从文本文件加载 ACL 规则。
+// 每行格式：<源IP> <目的IP> <源端口> <目的端口> <协议号> <pass|drop>
+// 以 # 开头的行和空行忽略。端口或协议写 0 表示精确匹配 0（暂不支持通配）。
+bool load_acl_file(fwd::AclTable& acl, const char* path) {
+    FILE* fp = std::fopen(path, "r");
+    if (fp == nullptr) {
+        std::fprintf(stderr, "打开 ACL 文件失败: %s\n", path);
+        return false;
+    }
+
+    char line[256];
+    uint32_t added = 0;
+    uint32_t lineno = 0;
+    while (std::fgets(line, sizeof(line), fp) != nullptr) {
+        ++lineno;
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') {
+            continue;
+        }
+
+        char src[64] = {0};
+        char dst[64] = {0};
+        char act[16] = {0};
+        unsigned sport = 0;
+        unsigned dport = 0;
+        unsigned proto = 0;
+
+        if (std::sscanf(line, "%63s %63s %u %u %u %15s",
+                        src, dst, &sport, &dport, &proto, act) != 6) {
+            std::fprintf(stderr, "第 %u 行格式不对，已跳过\n", lineno);
+            continue;
+        }
+
+        fwd::FiveTuple tuple;
+        in_addr a{};
+        if (inet_pton(AF_INET, src, &a) != 1) {
+            std::fprintf(stderr, "第 %u 行源 IP 非法: %s\n", lineno, src);
+            continue;
+        }
+        tuple.src_ip = ntohl(a.s_addr);
+        if (inet_pton(AF_INET, dst, &a) != 1) {
+            std::fprintf(stderr, "第 %u 行目的 IP 非法: %s\n", lineno, dst);
+            continue;
+        }
+        tuple.dst_ip = ntohl(a.s_addr);
+        tuple.src_port = static_cast<uint16_t>(sport);
+        tuple.dst_port = static_cast<uint16_t>(dport);
+        tuple.proto = static_cast<uint8_t>(proto);
+
+        const fwd::AclAction action =
+            (std::strcmp(act, "pass") == 0) ? fwd::AclAction::kPass : fwd::AclAction::kDrop;
+
+        if (acl.add(tuple, action)) {
+            ++added;
+        }
+    }
+    std::fclose(fp);
+
+    std::printf("已从 %s 加载 %u 条 ACL 规则\n", path, added);
+    return true;
 }
 
 }  // namespace
@@ -153,6 +274,17 @@ int main(int argc, char** argv) {
     }
     argc -= ret;
     argv += ret;
+
+    // 解析应用自己的参数（EAL 已经把它认识的参数摘走了）
+    const char* acl_file = nullptr;
+    bool default_allow = true;
+    for (int i = 0; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--acl") == 0 && i + 1 < argc) {
+            acl_file = argv[++i];
+        } else if (std::strcmp(argv[i], "--default-drop") == 0) {
+            default_allow = false;
+        }
+    }
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
@@ -171,13 +303,27 @@ int main(int argc, char** argv) {
     if (pool == nullptr) {
         rte_exit(EXIT_FAILURE, "内存池创建失败\n");
     }
-    std::printf("mbuf 内存池: %u 个，每个 %u 字节，cache %u\n",
-                fwd::kDefaultNbMbufs,
-                static_cast<unsigned>(RTE_MBUF_DEFAULT_BUF_SIZE),
-                fwd::kDefaultMbufCacheSize);
 
-    // 使用前两个端口做转发
-    const uint16_t use_ports = avail >= 2 ? 2 : avail;
+    Forwarder fw;
+    fw.default_action = default_allow ? fwd::AclAction::kPass : fwd::AclAction::kDrop;
+
+    if (!fw.acl.init(fwd::kDefaultAclEntries)) {
+        rte_exit(EXIT_FAILURE, "ACL 表初始化失败\n");
+    }
+    if (!fw.sessions.init(fwd::kDefaultSessionEntries)) {
+        rte_exit(EXIT_FAILURE, "会话表初始化失败\n");
+    }
+
+    if (acl_file != nullptr) {
+        load_acl_file(fw.acl, acl_file);
+    } else {
+        std::printf("未指定 --acl 文件，所有首包走默认动作: %s\n",
+                    fwd::action_name(fw.default_action));
+    }
+    std::printf("ACL 规则 %u 条，会话表容量 %u\n",
+                fw.acl.count(), fwd::kDefaultSessionEntries);
+
+    const uint16_t use_ports = 2;
     auto* port_objs = new fwd::Port[use_ports];
     for (uint16_t i = 0; i < use_ports; ++i) {
         fwd::PortConfig cfg;
@@ -203,7 +349,6 @@ int main(int argc, char** argv) {
 
     std::printf("\n开始转发（Ctrl+C 退出）...\n\n");
 
-    Forwarder fw;
     fw.ports = port_objs;
     fw.port_count = use_ports;
 
@@ -219,7 +364,6 @@ int main(int argc, char** argv) {
             if (nb_rx == 0) {
                 continue;
             }
-
             const uint64_t now_sec = rte_get_timer_cycles() / ticks_per_sec;
             for (uint16_t i = 0; i < nb_rx; ++i) {
                 fw.stats.rx_pkts += 1;
@@ -230,13 +374,16 @@ int main(int argc, char** argv) {
 
         const uint64_t now = rte_get_timer_cycles();
 
-        // MAC 表老化，每分钟一次
+        // 每分钟做一次老化：MAC 表 + 会话表
         if (now - last_age >= ticks_per_sec * 60) {
             last_age = now;
-            const uint32_t removed = fw.mac_table.age(now / ticks_per_sec);
-            if (removed > 0) {
-                std::printf("[老化] 清除 %u 条 MAC 表项，当前 %u 条\n",
-                            removed, fw.mac_table.size());
+            const uint32_t now_sec = static_cast<uint32_t>(now / ticks_per_sec);
+            const uint32_t mac_removed = fw.mac_table.age(now_sec);
+            const uint32_t sess_removed = fw.sessions.age(now_sec);
+            if (mac_removed > 0 || sess_removed > 0) {
+                std::printf("[老化] MAC 表清除 %u 条（余 %u），会话清除 %u 条（余 %u）\n",
+                            mac_removed, fw.mac_table.size(),
+                            sess_removed, fw.sessions.count());
             }
         }
 
@@ -251,13 +398,14 @@ int main(int argc, char** argv) {
             format_rate(static_cast<double>(d_rx_bytes) / elapsed, rx_rate, sizeof(rx_rate));
 
             std::printf("RX %" PRIu64 " pkt/s (%s) | TX %" PRIu64 " pkt/s | "
-                        "MAC 表 %u | 泛洪 %" PRIu64 " | 丢弃 %" PRIu64 "\n",
+                        "会话 %u | ACL命中 %" PRIu64 " | 会话命中 %" PRIu64 " | 拒绝 %" PRIu64 "\n",
                         static_cast<uint64_t>(static_cast<double>(d_rx) / elapsed),
                         rx_rate,
                         static_cast<uint64_t>(static_cast<double>(d_tx) / elapsed),
-                        fw.mac_table.size(),
-                        fw.stats.flooded,
-                        fw.stats.dropped);
+                        fw.sessions.count(),
+                        fw.stats.acl_hit,
+                        fw.stats.session_hit,
+                        fw.stats.denied);
             std::fflush(stdout);
 
             prev = fw.stats;
@@ -268,14 +416,19 @@ int main(int argc, char** argv) {
     std::printf("\n收到退出信号，正在停止...\n");
     std::printf("累计: RX %" PRIu64 " 包 / %" PRIu64 " 字节，TX %" PRIu64 " 包 / %" PRIu64 " 字节\n",
                 fw.stats.rx_pkts, fw.stats.rx_bytes, fw.stats.tx_pkts, fw.stats.tx_bytes);
-    std::printf("     泛洪 %" PRIu64 " 次，丢弃 %" PRIu64 " 个包，MAC 表 %u 条\n",
-                fw.stats.flooded, fw.stats.dropped, fw.mac_table.size());
+    std::printf("     泛洪 %" PRIu64 "，丢弃 %" PRIu64 "，拒绝 %" PRIu64 "\n",
+                fw.stats.flooded, fw.stats.dropped, fw.stats.denied);
+    std::printf("     ACL 命中 %" PRIu64 "，默认动作 %" PRIu64 "，会话命中 %" PRIu64 "\n",
+                fw.stats.acl_hit, fw.stats.acl_default, fw.stats.session_hit);
+    std::printf("     剩余会话 %u 条\n", fw.sessions.count());
 
     for (uint16_t i = 0; i < use_ports; ++i) {
         port_objs[i].stop();
     }
     delete[] port_objs;
 
+    fw.sessions.destroy();
+    fw.acl.destroy();
     rte_mempool_free(pool);
     rte_eal_cleanup();
     std::printf("已退出。\n");
