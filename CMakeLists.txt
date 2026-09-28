@@ -29,7 +29,20 @@ target_compile_options(${PROJECT_NAME} PRIVATE
 )
 
 target_link_directories(${PROJECT_NAME} PRIVATE ${DPDK_LIBRARY_DIRS})
-target_link_libraries(${PROJECT_NAME} PRIVATE ${DPDK_LIBRARIES})
+
+# openEuler / 部分发行版打包的 libdpdk.pc 把 bus 驱动（librte_bus_pci 等）
+# 放在了 Libs.private 里，动态链接时不会带上。后果是程序能编过，但 EAL
+# 启动时 PCI bus 没注册，`-a 0000:xx:xx.x` 这类设备参数会解析失败：
+#     EAL: failed to parse device "0000:02:00.1"
+# 这里显式补上要用到的 bus 库（重复链接同一库是无害的）。
+foreach(_bus rte_bus_pci rte_bus_vdev)
+    find_library(DPDK_${_bus}_LIB ${_bus} HINTS ${DPDK_LIBRARY_DIRS})
+    if(DPDK_${_bus}_LIB)
+        list(APPEND DPDK_EXTRA_LIBS ${DPDK_${_bus}_LIB})
+    endif()
+endforeach()
+
+target_link_libraries(${PROJECT_NAME} PRIVATE ${DPDK_LIBRARIES} ${DPDK_EXTRA_LIBS})
 
 # ---- 单元测试 ----
 option(BUILD_TESTS "构建单元测试" ON)
@@ -56,7 +69,7 @@ if(BUILD_TESTS)
         ${DPDK_CFLAGS_OTHER}
     )
     target_link_directories(test_basic PRIVATE ${DPDK_LIBRARY_DIRS})
-    target_link_libraries(test_basic PRIVATE ${DPDK_LIBRARIES})
+    target_link_libraries(test_basic PRIVATE ${DPDK_LIBRARIES} ${DPDK_EXTRA_LIBS})
 
     add_test(NAME basic COMMAND test_basic)
 endif()
